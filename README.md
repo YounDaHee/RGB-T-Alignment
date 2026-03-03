@@ -1,9 +1,12 @@
 
 **BEFORE YOU RUN IT, YOU MUST DOWNLOAD AND SAVE IT IN "checkpoints" FOLDER**
+
 MODEL LINK WRITED IN DEPTH ANYTHING v2(BLOW) SPECIFICATION
 
 for the testing just run the blow code.
+
 if it done, it will be print process time and in that folder(code folder) will save "aligned_rgb.jpg", "fusing.jpg", "th_undist.jpg" 
+
 ```
 python3 run.py --encoder vits --img-path test_align/RGB_PAN0.3TILT0.1.pcd --pcd-path test_align/cloud_PAN0.3TILT0.1.pcd --thermal-path test_align/THERMAL_PAN0.3TILT0.1.pcd --pan 0.3 --tilt 0.1 
 ```
