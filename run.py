@@ -123,7 +123,7 @@ if __name__ == '__main__':
     # Generate sparse depth map by projecting LiDAR points
     # into the RGB camera coordinate system (intrinsic + extrinsic)
     # (Project only points with minimum distance within a certain radius_default 10px)
-    depth_map_torch = util.points_npy_to_sparse_depth_map(lidar_fov_torch, rgb_undist.shape[:2][::-1], rgb_intrin, T_cam_lidar, radius_px=0)
+    depth_map_torch = util.points_npy_to_sparse_depth_map(lidar_fov_torch, rgb_undist.shape[:2][::-1], rgb_intrin, T_cam_lidar)
     
     if args.verbose : 
         import matplotlib.pyplot as plt
