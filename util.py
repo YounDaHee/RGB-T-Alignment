@@ -2,6 +2,7 @@
 import torch
 import numpy as np
 import open3d as o3d
+import torch.nn.functional as F
 
 def rot(psi: float) -> np.ndarray:
     c = np.cos(psi)
@@ -80,13 +81,6 @@ def depth_map_to_pcd(depth_map, K, device="cuda"):
     points = torch.stack((x, y, z), dim=1).contiguous()
 
     return points
-    # points_cpu = points.detach().cpu().numpy()   
-
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(points_cpu)
-    # o3d.io.write_point_cloud(output_path, pcd)
-
-    # print(f"Point cloud saved to {output_path}  |  Total points: {points_cpu.shape[0]:,}")
 
 @torch.no_grad()
 def project_and_mask(
@@ -169,7 +163,9 @@ def points_npy_to_sparse_depth_map(
     img_wh: tuple,
     K: np.ndarray,
     T_cam_lidar: np.ndarray,
-    device: str = "cuda"
+    device: str = "cuda",
+    radius_px: int = 10, # inspection radius
+    eps: float = 1e-4       
 ):
     if pts_lidar.ndim != 2 or pts_lidar.shape[1] < 3:
         raise ValueError(f"Expected (N,3) points, got {pts_lidar.shape}")
@@ -181,36 +177,60 @@ def points_npy_to_sparse_depth_map(
     else:
         pts = pts_lidar[:, :3].to(device=device, dtype=torch.float32)
 
-    T    = torch.from_numpy(T_cam_lidar).float().to(device)   # (4,4)
-    K_t  = torch.from_numpy(K).float().to(device)             # (3,3)
+    T   = torch.from_numpy(T_cam_lidar).to(device=device, dtype=torch.float32)  # (4,4)
+    K_t = torch.from_numpy(K).to(device=device, dtype=torch.float32)            # (3,3)
 
-    R = T[:3, :3]   # (3,3)
-    t = T[:3,  3]   # (3,)
-    pts_cam = pts[:, :3] @ R.T + t   # (N,3) 
+    R = T[:3, :3]
+    t = T[:3, 3]
+    pts_cam = pts @ R.T + t  # (N,3)
 
     X, Y, Z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
 
-    valid = Z > 0
+    valid = Z > 1e-6
     X, Y, Z = X[valid], Y[valid], Z[valid]
 
     fx, fy = K_t[0, 0], K_t[1, 1]
     cx, cy = K_t[0, 2], K_t[1, 2]
-    inv_Z = 1.0 / Z                         
-    u = torch.round(fx * X * inv_Z + cx).long()
-    v = torch.round(fy * Y * inv_Z + cy).long()
+
+    u = torch.round(fx * (X / Z) + cx).to(torch.int64)
+    v = torch.round(fy * (Y / Z) + cy).to(torch.int64)
 
     in_img = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     u, v, Z = u[in_img], v[in_img], Z[in_img]
 
-    pixel_idx        = v * W + u
+    if u.numel() == 0:
+        return torch.zeros((H, W), device=device, dtype=torch.float32)
 
-    sparse_gpu =  torch.full((H*W,), float("inf"), device=device, dtype=torch.float32)
-    sparse_gpu.scatter_reduce_(0, pixel_idx, Z, reduce="amin", include_self=True)
-    sparse_gpu = sparse_gpu.view(H, W)
+    pixel_idx = (v * W + u).to(torch.int64)
 
-    sparse_gpu = torch.where(torch.isinf(sparse_gpu), torch.zeros_like(sparse_gpu), sparse_gpu)
+    zbuf_flat = torch.full((H * W,), float("inf"), device=device, dtype=torch.float32)
+    zbuf_flat.scatter_reduce_(0, pixel_idx, Z.to(torch.float32), reduce="amin", include_self=True)
+    zbuf = zbuf_flat.view(H, W)
 
-    return sparse_gpu
+    # 2) Leave only the local minimum depth within radius_px
+    if radius_px > 0:
+        big = 1e9
+        z_for_pool = torch.where(torch.isinf(zbuf), torch.full_like(zbuf, big), zbuf)
+
+        k = 2 * radius_px + 1
+        # min-pooling = -max_pool(-x)
+        local_min = -F.max_pool2d((-z_for_pool)[None, None, ...],
+                                  kernel_size=k, stride=1, padding=radius_px)[0, 0]
+
+        local_min_flat = local_min.view(-1)
+
+        z_loc = local_min_flat[pixel_idx]
+        keep = Z <= (z_loc + eps)
+
+        pixel_idx_k = pixel_idx[keep]
+        Z_k = Z[keep].to(torch.float32)
+
+        zbuf_flat2 = torch.full((H * W,), float("inf"), device=device, dtype=torch.float32)
+        zbuf_flat2.scatter_reduce_(0, pixel_idx_k, Z_k, reduce="amin", include_self=True)
+        zbuf = zbuf_flat2.view(H, W)
+        
+    zbuf = torch.where(torch.isinf(zbuf), torch.zeros_like(zbuf), zbuf)
+    return zbuf
 
 
 @torch.no_grad()
