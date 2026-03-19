@@ -8,6 +8,9 @@ import time
 import util
 from depth_anything_v2.dpt import DepthAnythingV2
 
+from pathlib import Path
+
+
 T_lp = [
     [0.6510493062082845, -0.7590226062595021, 0.004414076658157591, 0.08314794370421265],
     [0.759010580110259, 0.6510640407127174, 0.004307455341268353, 0.0911459477578342],
@@ -55,13 +58,11 @@ def undistorting(img_src, domain='rgb') :
     if domain == 'rgb' :
         newK, roi = cv2.getOptimalNewCameraMatrix(rgb_intrin, rgb_dist, (w, h), 0.0, (w, h))
         undist = cv2.undistort(img, rgb_intrin, rgb_dist, None, newK)
-        rgb_intrin = newK
     else :
         newK, roi = cv2.getOptimalNewCameraMatrix(th_intrin, th_dist, (w, h), 0.0, (w, h))
         undist = cv2.undistort(img, th_intrin, th_dist, None, newK)
-        th_intrin = newK
         
-    return undist
+    return undist, newK
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Depth Anything V2')
@@ -92,88 +93,117 @@ if __name__ == '__main__':
         'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
     
+   
     depth_anything = DepthAnythingV2(**model_configs[args.encoder])
     depth_anything.load_state_dict(torch.load(f'checkpoints/depth_anything_v2_{args.encoder}.pth', map_location='cpu'))
     depth_anything = depth_anything.to(DEVICE).eval()
+    print(DEVICE)
     
     os.makedirs(args.outdir, exist_ok=True)
+    align_rgb_dir = f"{args.outdir}/align_rgb"
+    undis_thermal_dir = f"{args.outdir}/undis_thermal"
+    fusion_dir = f"{args.outdir}/fusion"
+    os.makedirs(align_rgb_dir, exist_ok=True)
+    os.makedirs(undis_thermal_dir, exist_ok=True)
+    os.makedirs(fusion_dir, exist_ok=True)
     
     cmap = matplotlib.colormaps.get_cmap('Spectral_r')
     
     start = time.perf_counter()
+    one_file = False
+    if(os.path.isdir(args.img_path)) : 
+        folder = Path(args.img_path)
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
 
-    print(f'Progress {args.img_path}')
-    rgb_undist = undistorting(args.img_path, 'rgb') # cv2.undistort(cv2.imread(args.img_path), rgb_intrin, rgb_dist)
-    
-    relative_depth = depth_anything.infer_image(rgb_undist, args.input_size)
-    
-    if args.verbose : 
-        depth = (relative_depth - relative_depth.min()) / (relative_depth.max() - relative_depth.min()) * 255.0
-        depth = depth.astype(np.uint8)
+        names = [
+            f.stem
+            for f in folder.rglob("*")
+                if f.is_file() and f.suffix.lower() in image_exts
+        ]
+    else :
+        names = [""]
+        one_file = True
+
+    for name in names : 
+        print(f'Progress {name}')
+        rgb_path = f"{args.img_path}/{name}.png"
+        thermal_path = f"{args.thermal_path}/{name}.png"
+        pcd_path = f"{args.pcd_path}/{name}.pcd"
+        if one_file :
+            rgb_path = args.img_path
+            thermal_path = args.thermal_path
+            pcd_path = args.pcd_path
+        rgb_undist, new_rgb_dist = undistorting(rgb_path, 'rgb')
+
+        relative_depth = depth_anything.infer_image(rgb_undist, args.input_size)
         
-        depth = (cmap(depth)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
+        if args.verbose : 
+            depth = (relative_depth - relative_depth.min()) / (relative_depth.max() - relative_depth.min()) * 255.0
+            depth = depth.astype(np.uint8)
+            
+            depth = (cmap(depth)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
+            
+            cv2.imwrite('relative_depth.png', depth)
+
+        T_cam_lidar = util.calculation_extrinsic(args.pan, args.tilt, T_tc, T_pt, T_lp)
+
+        # Align pcd to the pan-tilt camera's field of view (FOV)
+        # lidar_fov_torch = util.pcd_to_fov_npy(args.pcd_path, T_cam_lidar, rgb_intrin, rgb_undist.shape[:2][::-1])
+        lidar_fov_torch = util.pcd_to_fov_npy(pcd_path, T_cam_lidar, new_rgb_dist, rgb_undist.shape[:2][::-1])
+
+        # Generate sparse depth map by projecting LiDAR points
+        # into the RGB camera coordinate system (intrinsic + extrinsic)
+        # (Project only points with minimum distance within a certain radius_default 10px)
+        depth_map_torch = util.points_npy_to_sparse_depth_map(lidar_fov_torch, rgb_undist.shape[:2][::-1], new_rgb_dist, T_cam_lidar, radius_px=30)
         
-        cv2.imwrite('relative_depth.png', depth)
+        if args.verbose : 
+            import matplotlib.pyplot as plt
+            img_rgb = cv2.cvtColor(rgb_undist, cv2.COLOR_BGR2RGB)
 
-    T_cam_lidar = util.calculation_extrinsic(args.pan, args.tilt, T_tc, T_pt, T_lp)
+            depth = depth_map_torch.detach().cpu().numpy()
+            ys, xs = np.nonzero(depth > 0)
+            vals = depth[ys, xs]
 
-    # Align pcd to the pan-tilt camera's field of view (FOV)
-    lidar_fov_torch = util.pcd_to_fov_npy(args.pcd_path, T_cam_lidar, rgb_intrin, rgb_undist.shape[:2][::-1])
-
-    # Generate sparse depth map by projecting LiDAR points
-    # into the RGB camera coordinate system (intrinsic + extrinsic)
-    # (Project only points with minimum distance within a certain radius_default 10px)
-    depth_map_torch = util.points_npy_to_sparse_depth_map(lidar_fov_torch, rgb_undist.shape[:2][::-1], rgb_intrin, T_cam_lidar)
-    
-    if args.verbose : 
-        import matplotlib.pyplot as plt
-        img_rgb = cv2.cvtColor(rgb_undist, cv2.COLOR_BGR2RGB)
-
-        depth = depth_map_torch.detach().cpu().numpy()
-        ys, xs = np.nonzero(depth > 0)
-        vals = depth[ys, xs]
-
-        plt.figure(figsize=(10,6))
-        plt.imshow(img_rgb)
-        plt.scatter(xs, ys, c=vals, s=5, cmap="turbo", alpha=0.9)
-        plt.colorbar(label="Depth")
-        plt.axis("off")
-        plt.show()
+            plt.figure(figsize=(10,6))
+            plt.imshow(img_rgb)
+            plt.scatter(xs, ys, c=vals, s=5, cmap="turbo_r", alpha=0.9)
+            plt.colorbar(label="Depth")
+            plt.axis("off")
+            plt.show()
 
 
-    # Estimate scale and bias parameters to align relative depth with metric (absolute) depth
-    # and convert relative depth to absolute depth
-    scale_and_shift = util.compute_scale_and_shift (relative_depth, depth_map_torch)
+        # Estimate scale and bias parameters to align relative depth with metric (absolute) depth
+        # and convert relative depth to absolute depth
+        scale_and_shift = util.compute_scale_and_shift (relative_depth, depth_map_torch)
+        # Converting from depth map to pcd
+        absolute_depth = util.depth_map_to_pcd(scale_and_shift, new_rgb_dist)
 
-    # Converting from depth map to pcd
-    absolute_depth = util.depth_map_to_pcd(scale_and_shift, rgb_intrin)
+        points_cpu = absolute_depth.detach().cpu().numpy()   
 
-    points_cpu = absolute_depth.detach().cpu().numpy()   
+        if args.verbose : 
+            import open3d as o3d
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points_cpu)
+            o3d.io.write_point_cloud(f"/home/daheeyoun/CODE/komipo/Depth-Anything-V2/out_test/{name}absolut_depth.pcd", pcd)
+            print("saved")
 
-    if args.verbose : 
-        import open3d as o3d
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points_cpu)
-        o3d.io.write_point_cloud("absolut_depth.pcd", pcd)
-        print("saved")
+        th_undist, new_th_dist = undistorting(thermal_path, 'thermal')
 
-    th_undist = undistorting(args.thermal_path, 'thermal')
+        I = np.eye(4)
+        rt_rotation = tr_rotation.T
+        rt_translation_vector = -tr_rotation.T@tr_translation_vector
 
-    I = np.eye(4)
-    rt_rotation = tr_rotation.T
-    rt_translation_vector = -tr_rotation.T@tr_translation_vector
+        # Projecting colored pcd to fit thermal internal matrix
+        aligned_rgb = util.fuse_and_render_viewpoint_gpu(absolute_depth,
+                                    rgb_undist, new_rgb_dist, I[:3, :3], I[:3,3],
+                                    th_undist, new_th_dist, rt_rotation, rt_translation_vector,
+                                    device="cuda")
 
-    # Projecting colored pcd to fit thermal internal matrix
-    aligned_rgb = util.fuse_and_render_viewpoint_gpu(absolute_depth,
-                                rgb_undist, rgb_intrin, I[:3, :3], I[:3,3],
-                                th_undist, th_intrin, rt_rotation, rt_translation_vector,
-                                device="cuda")
+        cv2.imwrite(f"{align_rgb_dir}/{name}.jpg", aligned_rgb)
+        cv2.imwrite(f"{undis_thermal_dir}/{name}.jpg", th_undist)
 
-    cv2.imwrite("aligned_rgb.jpg", aligned_rgb)
-    cv2.imwrite("th_undist.jpg", th_undist)
-
-    fused_img = aligned_rgb*(1-args.th_fused_level) + th_undist*args.th_fused_level
-    cv2.imwrite("fusing.jpg", fused_img)
+        fused_img = aligned_rgb*(1-args.th_fused_level) + th_undist*args.th_fused_level
+        cv2.imwrite(f"{fusion_dir}/{name}.jpg", fused_img)
 
     print(f'processing tile : {time.perf_counter()-start}')
 
